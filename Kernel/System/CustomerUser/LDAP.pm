@@ -13,6 +13,8 @@ use strict;
 use warnings;
 
 use Net::LDAP;
+use Net::LDAP::Control::Paged;
+use Net::LDAP::Constant qw( LDAP_CONTROL_PAGED );
 
 use Kernel::System::Cache;
 use Kernel::System::Time;
@@ -236,48 +238,61 @@ sub CustomerName {
 
     # create ldap connect
     return if !$Self->_Connect();
+    
+    my $page = Net::LDAP::Control::Paged->new( size => 999 );
+    my $cookie;
 
-    # perform user search
-    my $Result = $Self->{LDAP}->search(
-        base      => $Self->{BaseDN},
-        scope     => $Self->{SScope},
-        filter    => $Filter,
-        sizelimit => $Self->{UserSearchListLimit},
-        attrs     => $Self->{CustomerUserMap}->{CustomerUserNameFields},
-    );
-
-    if ( $Result->code() ) {
-        $Self->{LogObject}->Log(
-            Priority => 'error',
-            Message  => 'Search failed! ' . $Result->error(),
+    while(1) {
+        # perform user search
+        my $Result = $Self->{LDAP}->search(
+            base      => $Self->{BaseDN},
+            scope     => $Self->{SScope},
+            filter    => $Filter,
+            sizelimit => $Self->{UserSearchListLimit},
+            attrs     => $Self->{CustomerUserMap}->{CustomerUserNameFields},
+            control   => [$page],
         );
-        return;
-    }
-
-    for my $Entry ( $Result->all_entries() ) {
-
-        for my $Field ( @{ $Self->{CustomerUserMap}->{CustomerUserNameFields} } ) {
-
-            if ( defined $Entry->get_value($Field) ) {
-
-                if ( !$Name ) {
-                    $Name = $Self->_ConvertFrom( $Entry->get_value($Field) );
-                }
-                else {
-                    $Name .= ' ' . $Self->_ConvertFrom( $Entry->get_value($Field) );
+    
+        if ( $Result->code() ) {
+            $Self->{LogObject}->Log(
+                Priority => 'error',
+                Message  => 'Search failed! ' . $Result->error(),
+            );
+            return;
+        }
+        
+        $Result->code and last;
+    
+        while( my $Entry = $Result->pop_entry() ) {
+    
+            for my $Field ( @{ $Self->{CustomerUserMap}->{CustomerUserNameFields} } ) {
+    
+                if ( defined $Entry->get_value($Field) ) {
+    
+                    if ( !$Name ) {
+                        $Name = $Self->_ConvertFrom( $Entry->get_value($Field) );
+                    }
+                    else {
+                        $Name .= ' ' . $Self->_ConvertFrom( $Entry->get_value($Field) );
+                    }
                 }
             }
         }
-    }
 
-    # cache request
-    if ( $Self->{CacheObject} ) {
-        $Self->{CacheObject}->Set(
-            Type  => $Self->{CacheType},
-            Key   => 'CustomerName::' . $Param{UserLogin},
-            Value => $Name,
-            TTL   => $Self->{CustomerUserMap}->{CacheTTL},
-        );
+        # check for next page
+        my ($resp) = $Result->control(LDAP_CONTROL_PAGED) or last;
+        $cookie = $resp->cookie or last;
+        $page->cookie($cookie);
+
+        # cache request
+        if ( $Self->{CacheObject} ) {
+            $Self->{CacheObject}->Set(
+                Type  => $Self->{CacheType},
+                Key   => 'CustomerName::' . $Param{UserLogin},
+                Value => $Name,
+                TTL   => $Self->{CustomerUserMap}->{CacheTTL},
+            );
+        }
     }
 
     return $Name;
